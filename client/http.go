@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"github.com/eichgee/dnstt-android/turbotunnel"
 )
 
 // A default Retry-After delay to use when there is no explicit Retry-After

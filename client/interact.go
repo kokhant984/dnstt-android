@@ -51,13 +51,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eichgee/dnstt-android/noise"
+	"github.com/eichgee/dnstt-android/turbotunnel"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"golang.org/x/sys/unix"
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/noise"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"github.com/eichgee/dnstt-android/dns"
 )
 
 // smux streams will be closed after this much time without receiving data.
