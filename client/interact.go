@@ -84,6 +84,7 @@ type ProtectedDialer struct {
 type Instance struct {
 	data   *Data
 	ln     *net.TCPListener
+	pconn  net.PacketConn
 	dialer *ProtectedDialer
 
 	log       Event
@@ -211,14 +212,11 @@ func (i *Instance) handle(local *net.TCPConn, sess *smux.Session, conv uint32) e
 }
 
 func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
-	defer pconn.Close()
-
 	var err error
 	i.ln, err = net.ListenTCP("tcp", localAddr)
 	if err != nil {
 		return fmt.Errorf("opening local listener: %v", err)
 	}
-	defer i.ln.Close()
 
 	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
 	if mtu < 80 {
@@ -233,7 +231,7 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 	// Open a KCP conn on the PacketConn.
 	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
 	if err != nil {
-		return fmt.Errorf("opening KCP conn: %v", err)
+		log.Printf("opening KCP conn: %v", err)
 	}
 	defer func() {
 		if i.log != nil {
@@ -265,7 +263,8 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := noise.NewClient(conn, pubkey)
 	if err != nil {
-		return err
+		log.Println(err)
+		return nil
 	}
 
 	// Start a smux session on the Noise channel.
@@ -275,10 +274,10 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
-		return fmt.Errorf("opening smux session: %v", err)
+		log.Printf("opening smux session: %v", err)
+		return nil
 	}
 	defer sess.Close()
-
 	for {
 		local, err := i.ln.Accept()
 		if err != nil {
@@ -352,7 +351,6 @@ func (i *Instance) Start() error {
 	// Iterate over the remote resolver address options and select one and
 	// only one.
 	var remoteAddr net.Addr
-	var pconn net.PacketConn
 	for _, opt := range []struct {
 		s string
 		f func(string) (net.Addr, net.PacketConn, error)
@@ -412,26 +410,24 @@ func (i *Instance) Start() error {
 		if opt.s == "" {
 			continue
 		}
-		if pconn != nil {
+		if i.pconn != nil {
 			return fmt.Errorf("only one of -doh, -dot, and -udp may be given")
 		}
 		var err error
-		remoteAddr, pconn, err = opt.f(opt.s)
+		remoteAddr, i.pconn, err = opt.f(opt.s)
 		if err != nil {
 			return err
 		}
 	}
-	if pconn == nil {
+
+	if i.pconn == nil {
 		return fmt.Errorf("one of -doh, -dot, or -udp is required")
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, i.closeChan)
-	err = i.run(pubkey, domain, localAddr, remoteAddr, pconn)
+	i.pconn = NewDNSPacketConn(i.pconn, remoteAddr, domain, i.closeChan)
+	err = i.run(pubkey, domain, localAddr, remoteAddr, i.pconn)
 	if err != nil {
-		if i.log != nil {
-			i.log.Status(fmt.Sprintf("test: %v", err))
-		}
-		log.Fatal(err)
+		return err
 	}
 
 	return nil
@@ -443,6 +439,11 @@ func (i *Instance) Stop() {
 	if i.ln != nil {
 		i.ln.Close()
 		i.ln = nil
+	}
+
+	if i.pconn != nil {
+		i.pconn.Close()
+		i.pconn = nil
 	}
 }
 

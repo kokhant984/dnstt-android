@@ -106,8 +106,7 @@ func (d *DnsPoint) Start() error {
 
 		d.running = true
 		go func() {
-			err := d.client.Start()
-			if err != nil {
+			if err := d.client.Start(); err != nil {
 				d.running = false
 				log.Println(err)
 			}
