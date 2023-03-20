@@ -1,4 +1,4 @@
-package dnsclient
+package client
 
 import (
 	"bytes"
@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
@@ -52,6 +51,8 @@ type HTTPPacketConn struct {
 	// were placed there by WriteTo, and inserts messages into the incoming
 	// queue to be returned from ReadFrom.
 	*turbotunnel.QueuePacketConn
+
+	closeCh <-chan struct{}
 }
 
 // NewHTTPPacketConn creates a new HTTPPacketConn configured to use the HTTP
@@ -59,7 +60,7 @@ type HTTPPacketConn struct {
 // that will be used to make requests. urlString should include any necessary
 // path components; e.g., "/dns-query". numSenders is the number of concurrent
 // sender-receiver goroutines to run.
-func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (*HTTPPacketConn, error) {
+func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int, closeChan <-chan struct{}) (*HTTPPacketConn, error) {
 	c := &HTTPPacketConn{
 		client: &http.Client{
 			Transport: rt,
@@ -67,7 +68,9 @@ func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (
 		},
 		urlString:       urlString,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
+		closeCh:         closeChan,
 	}
+
 	for i := 0; i < numSenders; i++ {
 		go c.sendLoop()
 	}
@@ -143,6 +146,7 @@ func (c *HTTPPacketConn) send(p []byte) error {
 // send. It drops packets while c.notBefore is in the future.
 func (c *HTTPPacketConn) sendLoop() {
 	for p := range c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}) {
+
 		// Stop sending while we are rate-limiting ourselves (as a
 		// result of a Retry-After response header, for example).
 		c.notBeforeLock.RLock()
@@ -156,6 +160,12 @@ func (c *HTTPPacketConn) sendLoop() {
 		err := c.send(p)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
+			select {
+			case <-c.closeCh:
+				log.Println("send loop exited")
+				return
+			default:
+			}
 		}
 	}
 }

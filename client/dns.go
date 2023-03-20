@@ -1,4 +1,4 @@
-package dnsclient
+package client
 
 import (
 	"bytes"
@@ -66,13 +66,15 @@ type DNSPacketConn struct {
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
 	*turbotunnel.QueuePacketConn
+
+	closeChan <-chan struct{}
 }
 
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
 // transport.WriteTo whenever a message needs to be sent.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, closeCh <-chan struct{}) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
@@ -80,6 +82,7 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
+		closeChan:       closeCh,
 	}
 	go func() {
 		err := c.recvLoop(transport)
@@ -248,26 +251,26 @@ func chunks(p []byte, n int) [][]byte {
 //
 // Here is an example of how a packet is encoded into a DNS name, using
 //
-//	p = "supercalifragilisticexpialidocious"
-//	c.clientID = "CLIENTID"
-//	domain = "t.example.com"
+//		p = "supercalifragilisticexpialidocious"
+//		c.clientID = "CLIENTID"
+//		domain = "t.example.com"
 //
-//  0. Start with the raw packet contents.
-//     supercalifragilisticexpialidocious
-//  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
+//	 0. Start with the raw packet contents.
+//	    supercalifragilisticexpialidocious
+//	 1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
 //
 // means a data packet of L bytes. A length prefix L >= 0xe0 means padding of L -
 // 0xe0 bytes (not counting the length of the length prefix itself).
 //
-//	\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
-//  2. Prefix the ClientID.
-//     CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
-//  3. Base32-encode, without padding and in lower case.
-//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
-//  4. Break into labels of at most 63 octets.
-//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
-//  5. Append the domain.
-//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+//		\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//	 2. Prefix the ClientID.
+//	    CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//	 3. Base32-encode, without padding and in lower case.
+//	    ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
+//	 4. Break into labels of at most 63 octets.
+//	    ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
+//	 5. Append the domain.
+//	    ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var decoded []byte
 	{
@@ -389,8 +392,14 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		// trying to send more than one packet per query.
 		err := c.send(transport, p, addr)
 		if err != nil {
-			log.Printf("send: %v", err)
-			continue
+			select {
+			case <-c.closeChan:
+				log.Println("send dns exited")
+				return fmt.Errorf("send dns exited")
+			default:
+				log.Printf("send: test %v", err)
+				continue
+			}
 		}
 	}
 }

@@ -36,7 +36,7 @@
 //	-utls '3*Firefox,2*Chrome,1*iOS'
 //	-utls Firefox
 //	-utls none
-package dnsclient
+package client
 
 import (
 	"context"
@@ -54,6 +54,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
+	"golang.org/x/sys/unix"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
@@ -75,23 +76,28 @@ type Data struct {
 	Domain string
 }
 
+type ProtectedDialer struct {
+	resolver *net.Resolver
+	log      Event
+}
+
 type Instance struct {
-	data *Data
-	conn net.PacketConn
-	log  *LoggerDns
+	data   *Data
+	ln     *net.TCPListener
+	dialer *ProtectedDialer
+
+	log       Event
+	closeChan chan struct{}
 }
 
-type LoggerDns interface {
+type Event interface {
 	Status(string)
-	Protect(int)
+	Protect(int) bool
 }
 
-func (i *Instance) SetData(d *Data) {
-	i.data = d
-}
-
-func New(log *LoggerDns) *Instance {
-	return &Instance{log: log}
+type resolved struct {
+	ip   net.IP
+	port int
 }
 
 // dnsNameCapacity returns the number of bytes remaining for encoded data after
@@ -149,15 +155,21 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 	return ids[sampleWeighted(weights)], nil
 }
 
-func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
+func (i *Instance) handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	stream, err := sess.OpenStream()
 	if err != nil {
 		return fmt.Errorf("session %08x opening stream: %v", conv, err)
 	}
 	defer func() {
+		if i.log != nil {
+			i.log.Status(fmt.Sprintf("end stream %08x:%d", conv, stream.ID()))
+		}
 		log.Printf("end stream %08x:%d", conv, stream.ID())
 		stream.Close()
 	}()
+	if i.log != nil {
+		i.log.Status(fmt.Sprintf("begin stream %08x:%d", conv, stream.ID()))
+	}
 	log.Printf("begin stream %08x:%d", conv, stream.ID())
 
 	var wg sync.WaitGroup
@@ -170,6 +182,9 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if i.log != nil {
+				i.log.Status(fmt.Sprintf("stream %08x:%d copy stream←local: %v", conv, stream.ID(), err))
+			}
 			log.Printf("stream %08x:%d copy stream←local: %v", conv, stream.ID(), err)
 		}
 		local.CloseRead()
@@ -183,6 +198,9 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if i.log != nil {
+				i.log.Status(fmt.Sprintf("stream %08x:%d copy local←stream: %v", conv, stream.ID(), err))
+			}
 			log.Printf("stream %08x:%d copy local←stream: %v", conv, stream.ID(), err)
 		}
 		local.CloseWrite()
@@ -192,18 +210,23 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return err
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
 	defer pconn.Close()
 
-	ln, err := net.ListenTCP("tcp", localAddr)
+	var err error
+	i.ln, err = net.ListenTCP("tcp", localAddr)
 	if err != nil {
 		return fmt.Errorf("opening local listener: %v", err)
 	}
-	defer ln.Close()
+	defer i.ln.Close()
 
 	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
+	}
+
+	if i.log != nil {
+		i.log.Status(fmt.Sprintf("effective MTU %d", mtu))
 	}
 	log.Printf("effective MTU %d", mtu)
 
@@ -213,10 +236,17 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		return fmt.Errorf("opening KCP conn: %v", err)
 	}
 	defer func() {
+		if i.log != nil {
+			i.log.Status(fmt.Sprintf("end session %08x", conn.GetConv()))
+		}
 		log.Printf("end session %08x", conn.GetConv())
 		conn.Close()
 	}()
+	if i.log != nil {
+		i.log.Status(fmt.Sprintf("begin session %08x", conn.GetConv()))
+	}
 	log.Printf("begin session %08x", conn.GetConv())
+
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
 	// Disable the dynamic congestion window (limit only by the maximum of
@@ -250,24 +280,34 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	defer sess.Close()
 
 	for {
-		local, err := ln.Accept()
+		local, err := i.ln.Accept()
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
-			return err
+			return nil
 		}
 		go func() {
 			defer local.Close()
-			err := handle(local.(*net.TCPConn), sess, conn.GetConv())
+			err := i.handle(local.(*net.TCPConn), sess, conn.GetConv())
 			if err != nil {
+				if i.log != nil {
+					i.log.Status(fmt.Sprintf("handle: %v", err))
+				}
 				log.Printf("handle: %v", err)
 			}
 		}()
 	}
+	return nil
 }
 
 func (i *Instance) Start() error {
+	i.closeChan = make(chan struct{})
+
+	if i.data.UtlsDistribution == "" {
+		i.data.UtlsDistribution = "3*Firefox_65,1*Firefox_63,1*iOS_12_1"
+	}
+
 	domain, err := dns.ParseName(i.data.Domain)
 	if err != nil {
 		return fmt.Errorf("invalid domain %+q: %v", i.data.Domain, err)
@@ -293,6 +333,7 @@ func (i *Instance) Start() error {
 			return fmt.Errorf("pubkey format error: %v", err)
 		}
 	}
+
 	if len(pubkey) == 0 {
 		return fmt.Errorf("the -pubkey or -pubkey-file option is required")
 	}
@@ -302,13 +343,16 @@ func (i *Instance) Start() error {
 		return fmt.Errorf("parsing -utls: %v", err)
 	}
 	if utlsClientHelloID != nil {
+		if i.log != nil {
+			i.log.Status(fmt.Sprintf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version))
+		}
 		log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
 	}
 
 	// Iterate over the remote resolver address options and select one and
 	// only one.
 	var remoteAddr net.Addr
-	var pconn net.PacketConn = i.conn
+	var pconn net.PacketConn
 	for _, opt := range []struct {
 		s string
 		f func(string) (net.Addr, net.PacketConn, error)
@@ -318,7 +362,10 @@ func (i *Instance) Start() error {
 			addr := turbotunnel.DummyAddr{}
 			var rt http.RoundTripper
 			if utlsClientHelloID == nil {
-				transport := http.DefaultTransport.(*http.Transport).Clone()
+				transport := &http.Transport{
+					Dial:        i.dialer.Dial,
+					DialContext: i.dialer.DialContext,
+				}
 				// Disable DefaultTransport's default Proxy =
 				// ProxyFromEnvironment setting, for conformity
 				// with utlsRoundTripper and with DoT mode,
@@ -327,9 +374,9 @@ func (i *Instance) Start() error {
 				transport.Proxy = nil
 				rt = transport
 			} else {
-				rt = NewUTLSRoundTripper(nil, utlsClientHelloID)
+				rt = NewUTLSRoundTripper(nil, utlsClientHelloID, i.dialer)
 			}
-			pconn, err := NewHTTPPacketConn(rt, i.data.DohURL, 32)
+			pconn, err := NewHTTPPacketConn(rt, i.data.DohURL, 32, i.closeChan)
 			return addr, pconn, err
 		}},
 		// -dot
@@ -337,25 +384,31 @@ func (i *Instance) Start() error {
 			addr := turbotunnel.DummyAddr{}
 			var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 			if utlsClientHelloID == nil {
-				dialTLSContext = (&tls.Dialer{}).DialContext
+				dialTLSContext = (&tls.Dialer{
+					NetDialer: &net.Dialer{
+						Resolver: i.dialer.resolver,
+					}}).DialContext
 			} else {
 				dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
+					return i.dialer.utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
 				}
 			}
+
 			pconn, err := NewTLSPacketConn(i.data.DotAddr, dialTLSContext)
 			return addr, pconn, err
 		}},
 		// -udp
 		{i.data.UdpAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr, err := net.ResolveUDPAddr("udp", s)
+			resolved, err := i.dialer.lookupAddr(s)
 			if err != nil {
 				return nil, nil, err
 			}
-			pconn, err := net.ListenUDP("udp", nil)
+			addr := &net.UDPAddr{IP: resolved.ip, Port: resolved.port}
+			pconn, err := i.dialer.ListenUDP()
 			return addr, pconn, err
 		}},
 	} {
+
 		if opt.s == "" {
 			continue
 		}
@@ -372,24 +425,177 @@ func (i *Instance) Start() error {
 		return fmt.Errorf("one of -doh, -dot, or -udp is required")
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
-	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
+	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, i.closeChan)
+	err = i.run(pubkey, domain, localAddr, remoteAddr, pconn)
 	if err != nil {
+		if i.log != nil {
+			i.log.Status(fmt.Sprintf("test: %v", err))
+		}
 		log.Fatal(err)
 	}
 
 	return nil
 }
 
-func (i *Instance) Stop() error {
+func (i *Instance) Stop() {
+	close(i.closeChan)
 
-	if i.conn != nil {
-		err := i.conn.Close()
-		if err != nil {
-			return err
-		}
-		i.conn = nil
+	if i.ln != nil {
+		i.ln.Close()
+		i.ln = nil
+	}
+}
+
+func (i *Instance) SetData(d *Data) {
+	i.data = d
+}
+
+func newProtectedDialer(ev Event) *ProtectedDialer {
+	return &ProtectedDialer{
+		resolver: &net.Resolver{PreferGo: false},
+		log:      ev,
+	}
+}
+
+func (d *ProtectedDialer) lookupAddr(addr string) (*resolved, error) {
+
+	var (
+		err        error
+		host, port string
+		portnum    int
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if host, port, err = net.SplitHostPort(addr); err != nil {
+		log.Println("PrepareDomain SplitHostPort Error")
+		return nil, err
 	}
 
-	return nil
+	if portnum, err = d.resolver.LookupPort(ctx, "tcp", port); err != nil {
+		log.Println("PrepareDomain LookupPort Error")
+		return nil, err
+	}
+
+	addrs, err := d.resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("domain failed to resolve")
+	}
+
+	IPs := make([]net.IP, len(addrs))
+	for i, ia := range addrs {
+		IPs[i] = ia.IP
+	}
+
+	r := &resolved{
+		ip:   IPs[0],
+		port: portnum,
+	}
+
+	return r, nil
+}
+
+func getFd(network string) (fd int, err error) {
+	switch network {
+	case "tcp":
+		fd, err = unix.Socket(unix.AF_INET, unix.SOCK_STREAM, unix.IPPROTO_TCP)
+	case "udp":
+		fd, err = unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
+	default:
+		err = fmt.Errorf("unknow network")
+	}
+	return
+}
+
+func (p *ProtectedDialer) DialContext(context context.Context, network, address string) (net.Conn, error) {
+	fd, err := getFd(network)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer unix.Close(fd)
+
+	// call android VPN service to "protect" the fd connecting straight out
+	p.log.Protect(fd)
+
+	resolved, err := p.lookupAddr(address)
+
+	if err != nil {
+		return nil, err
+	}
+
+	addr := &net.TCPAddr{IP: resolved.ip, Port: resolved.port}
+
+	sa := &unix.SockaddrInet4{
+		Port: addr.Port,
+	}
+	copy(sa.Addr[:], addr.IP.To4())
+
+	log.Println(sa)
+
+	if err := unix.Connect(fd, sa); err != nil {
+		log.Print("fdConn unix.Connect error")
+		return nil, err
+	}
+
+	file := os.NewFile(uintptr(fd), "Socket")
+	if file == nil {
+		// returned value will be nil if fd is not a valid file descriptor
+		return nil, errors.New("fdConn fd invalid")
+	}
+
+	defer file.Close()
+	//Closing conn does not affect file, and closing file does not affect conn.
+	conn, err := net.FileConn(file)
+	if err != nil {
+		log.Print("fdConn FileConn Close Fd error")
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func (p *ProtectedDialer) Dial(network, address string) (net.Conn, error) {
+	return p.DialContext(context.Background(), network, address)
+}
+
+func (p *ProtectedDialer) ListenUDP() (net.PacketConn, error) {
+	fd, err := getFd("udp")
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer unix.Close(fd)
+
+	// call android VPN service to "protect" the fd connecting straight out
+	p.log.Protect(fd)
+
+	file := os.NewFile(uintptr(fd), "Socket")
+	if file == nil {
+		// returned value will be nil if fd is not a valid file descriptor
+		return nil, errors.New("fdConn fd invalid")
+	}
+
+	defer file.Close()
+	//Closing conn does not affect file, and closing file does not affect conn.
+	conn, err := net.FilePacketConn(file)
+	if err != nil {
+		log.Print("fdConn FileConn Close Fd error")
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func New(event Event) *Instance {
+	return &Instance{
+		log:    event,
+		dialer: newProtectedDialer(event),
+	}
 }
