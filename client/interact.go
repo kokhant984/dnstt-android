@@ -51,13 +51,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eichgee/dnstt-android/dns"
 	"github.com/eichgee/dnstt-android/noise"
 	"github.com/eichgee/dnstt-android/turbotunnel"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"golang.org/x/sys/unix"
-	"github.com/eichgee/dnstt-android/dns"
 )
 
 // smux streams will be closed after this much time without receiving data.
@@ -156,6 +156,47 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 	return ids[sampleWeighted(weights)], nil
 }
 
+func createSmuxSession(remoteAddr net.Addr, pconn net.PacketConn, mtu int, pubkey []byte) (*kcp.UDPSession, *smux.Session, error) {
+	// Open a KCP conn on the PacketConn.
+	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
+	}
+	log.Printf("begin session %08x", conn.GetConv())
+	// Permit coalescing the payloads of consecutive sends.
+	conn.SetStreamMode(true)
+	// Disable the dynamic congestion window (limit only by the maximum of
+	// local and remote static windows).
+	conn.SetNoDelay(
+		0, // default nodelay
+		0, // default interval
+		0, // default resend
+		1, // nc=1 => congestion window off
+	)
+	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	if rc := conn.SetMtu(mtu); !rc {
+		panic(rc)
+	}
+
+	// Put a Noise channel on top of the KCP conn.
+	rw, err := noise.NewClient(conn, pubkey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Start a smux session on the Noise channel.
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = 2
+	smuxConfig.KeepAliveTimeout = idleTimeout
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	sess, err := smux.Client(rw, smuxConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening smux session: %v", err)
+	}
+
+	return conn, sess, err
+}
+
 func (i *Instance) handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	stream, err := sess.OpenStream()
 	if err != nil {
@@ -228,55 +269,16 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 	}
 	log.Printf("effective MTU %d", mtu)
 
-	// Open a KCP conn on the PacketConn.
-	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
+	conn, sess, err := createSmuxSession(remoteAddr, pconn, mtu, pubkey)
 	if err != nil {
-		log.Printf("opening KCP conn: %v", err)
+		return err
 	}
+
 	defer func() {
-		if i.log != nil {
-			i.log.Status(fmt.Sprintf("end session %08x", conn.GetConv()))
-		}
 		log.Printf("end session %08x", conn.GetConv())
 		conn.Close()
 	}()
-	if i.log != nil {
-		i.log.Status(fmt.Sprintf("begin session %08x", conn.GetConv()))
-	}
-	log.Printf("begin session %08x", conn.GetConv())
 
-	// Permit coalescing the payloads of consecutive sends.
-	conn.SetStreamMode(true)
-	// Disable the dynamic congestion window (limit only by the maximum of
-	// local and remote static windows).
-	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
-	)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-	if rc := conn.SetMtu(mtu); !rc {
-		panic(rc)
-	}
-
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewClient(conn, pubkey)
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	// Start a smux session on the Noise channel.
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	sess, err := smux.Client(rw, smuxConfig)
-	if err != nil {
-		log.Printf("opening smux session: %v", err)
-		return nil
-	}
 	defer sess.Close()
 	for {
 		local, err := i.ln.Accept()
@@ -288,6 +290,12 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 		}
 		go func() {
 			defer local.Close()
+			if sess.IsClosed() {
+				conn, sess, err = createSmuxSession(remoteAddr, pconn, mtu, pubkey)
+				if err != nil {
+					log.Println(err)
+				}
+			}
 			err := i.handle(local.(*net.TCPConn), sess, conn.GetConv())
 			if err != nil {
 				if i.log != nil {
@@ -536,8 +544,6 @@ func (p *ProtectedDialer) DialContext(context context.Context, network, address 
 		Port: addr.Port,
 	}
 	copy(sa.Addr[:], addr.IP.To4())
-
-	log.Println(sa)
 
 	if err := unix.Connect(fd, sa); err != nil {
 		log.Print("fdConn unix.Connect error")

@@ -394,10 +394,9 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		if err != nil {
 			select {
 			case <-c.closeChan:
-				log.Println("send dns exited")
 				return fmt.Errorf("send dns exited")
 			default:
-				log.Printf("send: test %v", err)
+				log.Printf("send: %v", err)
 				continue
 			}
 		}

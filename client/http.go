@@ -162,7 +162,6 @@ func (c *HTTPPacketConn) sendLoop() {
 			log.Printf("sendLoop: %v", err)
 			select {
 			case <-c.closeCh:
-				log.Println("send loop exited")
 				return
 			default:
 			}
