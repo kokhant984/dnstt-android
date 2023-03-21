@@ -162,7 +162,6 @@ func createSmuxSession(remoteAddr net.Addr, pconn net.PacketConn, mtu int, pubke
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
 	}
-	log.Printf("begin session %08x", conn.GetConv())
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
 	// Disable the dynamic congestion window (limit only by the maximum of
@@ -273,6 +272,8 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 	if err != nil {
 		return err
 	}
+
+	log.Printf("begin session %08x", conn.GetConv())
 
 	defer func() {
 		log.Printf("end session %08x", conn.GetConv())
