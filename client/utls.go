@@ -155,7 +155,8 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	switch req.URL.Scheme {
 	case "http":
 		// If http, don't invoke uTLS; just pass it to an ordinary http.Transport.
-		return http.DefaultTransport.RoundTrip(req)
+		h := &http.Transport{Dial: rt.dialer.Dial, DialContext: rt.dialer.DialContext}
+		return h.RoundTrip(req)
 	case "https":
 	default:
 		return nil, fmt.Errorf("unsupported URL scheme %q", req.URL.Scheme)

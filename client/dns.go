@@ -11,8 +11,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/eichgee/dnstt-android/turbotunnel"
 	"github.com/eichgee/dnstt-android/dns"
+	"github.com/eichgee/dnstt-android/turbotunnel"
 )
 
 const (
@@ -66,15 +66,13 @@ type DNSPacketConn struct {
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
 	*turbotunnel.QueuePacketConn
-
-	closeChan <-chan struct{}
 }
 
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
 // transport.WriteTo whenever a message needs to be sent.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, closeCh <-chan struct{}) *DNSPacketConn {
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
@@ -82,7 +80,6 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
-		closeChan:       closeCh,
 	}
 	go func() {
 		err := c.recvLoop(transport)
@@ -392,13 +389,8 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		// trying to send more than one packet per query.
 		err := c.send(transport, p, addr)
 		if err != nil {
-			select {
-			case <-c.closeChan:
-				return fmt.Errorf("send dns exited")
-			default:
-				log.Printf("send: %v", err)
-				continue
-			}
+			log.Printf("send: %v", err)
+			continue
 		}
 	}
 }

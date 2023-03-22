@@ -47,7 +47,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,18 +79,18 @@ type Data struct {
 }
 
 type ProtectedDialer struct {
-	resolver *net.Resolver
-	log      Event
+	currentServer string
+	server        *resolved
+	resolver      *net.Resolver
+	log           Event
 }
 
 type Instance struct {
 	data   *Data
 	ln     *net.TCPListener
-	pconn  net.PacketConn
 	dialer *ProtectedDialer
 
-	log       Event
-	closeChan chan struct{}
+	log Event
 }
 
 type Event interface {
@@ -156,11 +158,93 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 	return ids[sampleWeighted(weights)], nil
 }
 
-func createSmuxSession(remoteAddr net.Addr, pconn net.PacketConn, mtu int, pubkey []byte) (*kcp.UDPSession, *smux.Session, error) {
+func (i *Instance) createConnection(utlsClientHelloID *utls.ClientHelloID, domain dns.Name) (net.Addr, net.PacketConn, error) {
+	// Iterate over the remote resolver address options and select one and
+	// only one.
+	var remoteAddr net.Addr
+	var pconn net.PacketConn
+	var err error
+	for _, opt := range []struct {
+		s string
+		f func(string) (net.Addr, net.PacketConn, error)
+	}{
+		// -doh
+		{i.data.DohURL, func(s string) (net.Addr, net.PacketConn, error) {
+			addr := turbotunnel.DummyAddr{}
+			var rt http.RoundTripper
+			if utlsClientHelloID == nil {
+				transport := &http.Transport{
+					Dial:        i.dialer.Dial,
+					DialContext: i.dialer.DialContext,
+				}
+				// Disable DefaultTransport's default Proxy =
+				// ProxyFromEnvironment setting, for conformity
+				// with utlsRoundTripper and with DoT mode,
+				// which do not take a proxy from the
+				// environment.
+				transport.Proxy = nil
+				rt = transport
+			} else {
+				rt = NewUTLSRoundTripper(nil, utlsClientHelloID, i.dialer)
+			}
+			pconn, err := NewHTTPPacketConn(rt, s, 32)
+			return addr, pconn, err
+		}},
+		// -dot
+		{i.data.DotAddr, func(s string) (net.Addr, net.PacketConn, error) {
+			addr := turbotunnel.DummyAddr{}
+			var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
+			if utlsClientHelloID == nil {
+				dialTLSContext = (&tls.Dialer{
+					NetDialer: &net.Dialer{
+						Resolver: i.dialer.resolver,
+					}}).DialContext
+			} else {
+				dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return i.dialer.utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
+				}
+			}
+
+			pconn, err := NewTLSPacketConn(s, dialTLSContext)
+			return addr, pconn, err
+		}},
+		// -udp
+		{i.data.UdpAddr, func(s string) (net.Addr, net.PacketConn, error) {
+			resolved, err := i.dialer.lookupAddr(s)
+			if err != nil {
+				return nil, nil, err
+			}
+			addr := &net.UDPAddr{IP: resolved.ip, Port: resolved.port}
+			pconn, err := i.dialer.ListenUDP()
+			return addr, pconn, err
+		}},
+	} {
+
+		if opt.s == "" {
+			continue
+		}
+		if pconn != nil {
+			return nil, nil, fmt.Errorf("only one of -doh, -dot, and -udp may be given")
+		}
+		remoteAddr, pconn, err = opt.f(opt.s)
+		if err != nil {
+			return nil, nil, err
+		}
+		pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
+		return remoteAddr, pconn, err
+	}
+	return nil, nil, err
+}
+
+func (i *Instance) createSmuxSession(mtu int, pubkey []byte, clientHello *utls.ClientHelloID, domain dns.Name) (net.PacketConn, *kcp.UDPSession, *smux.Session, error) {
+	remoteAddr, pconn, err := i.createConnection(clientHello, domain)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	// Open a KCP conn on the PacketConn.
 	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
+		return nil, nil, nil, fmt.Errorf("opening KCP conn: %v", err)
 	}
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
@@ -180,20 +264,20 @@ func createSmuxSession(remoteAddr net.Addr, pconn net.PacketConn, mtu int, pubke
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := noise.NewClient(conn, pubkey)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Start a smux session on the Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
+	smuxConfig.KeepAliveTimeout = 15 * time.Second
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening smux session: %v", err)
+		return nil, nil, nil, fmt.Errorf("opening smux session: %v", err)
 	}
 
-	return conn, sess, err
+	return pconn, conn, sess, err
 }
 
 func (i *Instance) handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
@@ -251,7 +335,7 @@ func (i *Instance) handle(local *net.TCPConn, sess *smux.Session, conv uint32) e
 	return err
 }
 
-func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+func (i *Instance) run(utlsClientHelloID *utls.ClientHelloID, pubkey []byte, domain dns.Name, localAddr *net.TCPAddr) error {
 	var err error
 	i.ln, err = net.ListenTCP("tcp", localAddr)
 	if err != nil {
@@ -268,19 +352,32 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 	}
 	log.Printf("effective MTU %d", mtu)
 
-	conn, sess, err := createSmuxSession(remoteAddr, pconn, mtu, pubkey)
+	pconn, conn, sess, err := i.createSmuxSession(mtu, pubkey, utlsClientHelloID, domain)
 	if err != nil {
 		return err
 	}
 
+	var connLocker = new(sync.Mutex)
+
 	log.Printf("begin session %08x", conn.GetConv())
 
-	defer func() {
-		log.Printf("end session %08x", conn.GetConv())
-		conn.Close()
-	}()
+	close := func() {
+		log.Println("closing conn")
+		if sess != nil {
+			sess.Close()
+		}
 
-	defer sess.Close()
+		if conn != nil {
+			conn.Close()
+		}
+
+		if pconn != nil {
+			pconn.Close()
+		}
+	}
+
+	defer close()
+
 	for {
 		local, err := i.ln.Accept()
 		if err != nil {
@@ -289,14 +386,23 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 			}
 			return nil
 		}
+
 		go func() {
 			defer local.Close()
+
 			if sess.IsClosed() {
-				conn, sess, err = createSmuxSession(remoteAddr, pconn, mtu, pubkey)
+				connLocker.Lock()
+				defer connLocker.Unlock()
+
+				close()
+				
+				pconn, conn, sess, err = i.createSmuxSession(mtu, pubkey, utlsClientHelloID, domain)
 				if err != nil {
-					log.Println(err)
+					log.Println("createSmuxSession: ", err)
+					return
 				}
 			}
+
 			err := i.handle(local.(*net.TCPConn), sess, conn.GetConv())
 			if err != nil {
 				if i.log != nil {
@@ -306,12 +412,9 @@ func (i *Instance) run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, r
 			}
 		}()
 	}
-	return nil
 }
 
 func (i *Instance) Start() error {
-	i.closeChan = make(chan struct{})
-
 	if i.data.UtlsDistribution == "" {
 		i.data.UtlsDistribution = "3*Firefox_65,1*Firefox_63,1*iOS_12_1"
 	}
@@ -357,84 +460,53 @@ func (i *Instance) Start() error {
 		log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
 	}
 
-	// Iterate over the remote resolver address options and select one and
-	// only one.
-	var remoteAddr net.Addr
 	for _, opt := range []struct {
-		s string
-		f func(string) (net.Addr, net.PacketConn, error)
+		dnsAddr string
 	}{
-		// -doh
-		{i.data.DohURL, func(s string) (net.Addr, net.PacketConn, error) {
-			addr := turbotunnel.DummyAddr{}
-			var rt http.RoundTripper
-			if utlsClientHelloID == nil {
-				transport := &http.Transport{
-					Dial:        i.dialer.Dial,
-					DialContext: i.dialer.DialContext,
-				}
-				// Disable DefaultTransport's default Proxy =
-				// ProxyFromEnvironment setting, for conformity
-				// with utlsRoundTripper and with DoT mode,
-				// which do not take a proxy from the
-				// environment.
-				transport.Proxy = nil
-				rt = transport
-			} else {
-				rt = NewUTLSRoundTripper(nil, utlsClientHelloID, i.dialer)
-			}
-			pconn, err := NewHTTPPacketConn(rt, i.data.DohURL, 32, i.closeChan)
-			return addr, pconn, err
-		}},
-		// -dot
-		{i.data.DotAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr := turbotunnel.DummyAddr{}
-			var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
-			if utlsClientHelloID == nil {
-				dialTLSContext = (&tls.Dialer{
-					NetDialer: &net.Dialer{
-						Resolver: i.dialer.resolver,
-					}}).DialContext
-			} else {
-				dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return i.dialer.utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
-				}
-			}
-
-			pconn, err := NewTLSPacketConn(i.data.DotAddr, dialTLSContext)
-			return addr, pconn, err
-		}},
-		// -udp
-		{i.data.UdpAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			resolved, err := i.dialer.lookupAddr(s)
-			if err != nil {
-				return nil, nil, err
-			}
-			addr := &net.UDPAddr{IP: resolved.ip, Port: resolved.port}
-			pconn, err := i.dialer.ListenUDP()
-			return addr, pconn, err
-		}},
+		{i.data.DohURL}, {i.data.DotAddr}, {i.data.UdpAddr},
 	} {
-
-		if opt.s == "" {
+		var (
+			err          error
+			host         string
+			resolvedHost *resolved
+		)
+		if opt.dnsAddr == "" {
 			continue
 		}
-		if i.pconn != nil {
-			return fmt.Errorf("only one of -doh, -dot, and -udp may be given")
+
+		if strings.HasPrefix(opt.dnsAddr, "https://") {
+			var url *url.URL
+			url, err = url.Parse(opt.dnsAddr)
+			if err != nil {
+				log.Println(err)
+			} else {
+				s, err := addrForDial(url)
+				if err != nil {
+					log.Println(err)
+				} else {
+					host = s
+					resolvedHost, err = i.dialer.lookupAddr(s)
+					if err != nil {
+						log.Println(err)
+					}
+				}
+			}
+		} else {
+			host = opt.dnsAddr
+			resolvedHost, err = i.dialer.lookupAddr(opt.dnsAddr)
 		}
-		var err error
-		remoteAddr, i.pconn, err = opt.f(opt.s)
+
 		if err != nil {
 			return err
 		}
+
+		i.dialer.currentServer = host
+		i.dialer.server = resolvedHost
+
+		break
 	}
 
-	if i.pconn == nil {
-		return fmt.Errorf("one of -doh, -dot, or -udp is required")
-	}
-
-	i.pconn = NewDNSPacketConn(i.pconn, remoteAddr, domain, i.closeChan)
-	err = i.run(pubkey, domain, localAddr, remoteAddr, i.pconn)
+	err = i.run(utlsClientHelloID, pubkey, domain, localAddr)
 	if err != nil {
 		return err
 	}
@@ -443,16 +515,9 @@ func (i *Instance) Start() error {
 }
 
 func (i *Instance) Stop() {
-	close(i.closeChan)
-
 	if i.ln != nil {
 		i.ln.Close()
 		i.ln = nil
-	}
-
-	if i.pconn != nil {
-		i.pconn.Close()
-		i.pconn = nil
 	}
 }
 
@@ -496,13 +561,21 @@ func (d *ProtectedDialer) lookupAddr(addr string) (*resolved, error) {
 		return nil, fmt.Errorf("domain failed to resolve")
 	}
 
-	IPs := make([]net.IP, len(addrs))
-	for i, ia := range addrs {
-		IPs[i] = ia.IP
+	var ip net.IP
+	for _, ia := range addrs {
+		if ia.IP.To4() == nil {
+			continue
+		}
+		ip = ia.IP
+		break
+	}
+
+	if ip == nil {
+		return nil, fmt.Errorf("domain failed to resolve to ipv4")
 	}
 
 	r := &resolved{
-		ip:   IPs[0],
+		ip:   ip,
 		port: portnum,
 	}
 
@@ -522,6 +595,7 @@ func getFd(network string) (fd int, err error) {
 }
 
 func (p *ProtectedDialer) DialContext(context context.Context, network, address string) (net.Conn, error) {
+	log.Printf("dial, origin addr: %v, cached addr: %v\n, resolved: %v", address, p.currentServer, p.server)
 	fd, err := getFd(network)
 
 	if err != nil {
@@ -533,18 +607,23 @@ func (p *ProtectedDialer) DialContext(context context.Context, network, address 
 	// call android VPN service to "protect" the fd connecting straight out
 	p.log.Protect(fd)
 
-	resolved, err := p.lookupAddr(address)
+	var resolved *resolved
+
+	if strings.Compare(address, p.currentServer) == 0 && p.server != nil {
+		log.Println("dial address is same, using dns cache")
+		resolved = p.server
+	} else {
+		resolved, err = p.lookupAddr(address)
+	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	addr := &net.TCPAddr{IP: resolved.ip, Port: resolved.port}
-
 	sa := &unix.SockaddrInet4{
-		Port: addr.Port,
+		Port: resolved.port,
 	}
-	copy(sa.Addr[:], addr.IP.To4())
+	copy(sa.Addr[:], resolved.ip.To4())
 
 	if err := unix.Connect(fd, sa); err != nil {
 		log.Print("fdConn unix.Connect error")

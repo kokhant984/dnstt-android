@@ -51,8 +51,6 @@ type HTTPPacketConn struct {
 	// were placed there by WriteTo, and inserts messages into the incoming
 	// queue to be returned from ReadFrom.
 	*turbotunnel.QueuePacketConn
-
-	closeCh <-chan struct{}
 }
 
 // NewHTTPPacketConn creates a new HTTPPacketConn configured to use the HTTP
@@ -60,7 +58,7 @@ type HTTPPacketConn struct {
 // that will be used to make requests. urlString should include any necessary
 // path components; e.g., "/dns-query". numSenders is the number of concurrent
 // sender-receiver goroutines to run.
-func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int, closeChan <-chan struct{}) (*HTTPPacketConn, error) {
+func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (*HTTPPacketConn, error) {
 	c := &HTTPPacketConn{
 		client: &http.Client{
 			Transport: rt,
@@ -68,7 +66,6 @@ func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int, c
 		},
 		urlString:       urlString,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
-		closeCh:         closeChan,
 	}
 
 	for i := 0; i < numSenders; i++ {
@@ -160,11 +157,6 @@ func (c *HTTPPacketConn) sendLoop() {
 		err := c.send(p)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
-			select {
-			case <-c.closeCh:
-				return
-			default:
-			}
 		}
 	}
 }
